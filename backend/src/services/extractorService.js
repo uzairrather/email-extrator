@@ -175,61 +175,79 @@ async function geminiClassifyAndExtract(from, subject, snippet, bodyText) {
   const client = getGemini();
   if (!client || !checkDailyLimit()) return null;
 
+  // 7s delay between calls — Gemini free tier is 10 RPM
+  await sleep(7000);
+
   const emailContent = `From: ${from || 'unknown'}
 Subject: ${subject || 'no subject'}
 Body:
 ${(bodyText || snippet || 'no content').slice(0, 3000)}`;
 
-  try {
-    const response = await client.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: [
-        {
-          role: 'user',
-          parts: [{ text: `${COMBINED_PROMPT}\n\nEMAIL:\n${emailContent}` }],
+  // Retry up to 2 times on rate limit
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await client.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: `${COMBINED_PROMPT}\n\nEMAIL:\n${emailContent}` }],
+          },
+        ],
+        config: {
+          temperature: 0.1,
+          maxOutputTokens: 800,
+          responseMimeType: 'application/json',
         },
-      ],
-      config: {
-        temperature: 0.1,
-        maxOutputTokens: 800,
-        responseMimeType: 'application/json',
-      },
-    });
+      });
 
-    dailyRequestCount++;
+      dailyRequestCount++;
 
-    const raw = response.text.trim();
-    // Clean potential markdown wrapping
-    const cleaned = raw.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
-    const parsed = JSON.parse(cleaned);
+      const raw = response.text.trim();
+      const cleaned = raw.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+      const parsed = JSON.parse(cleaned);
 
-    const category = CATEGORIES.includes(parsed.category) ? parsed.category : 'other';
+      const category = CATEGORIES.includes(parsed.category) ? parsed.category : 'other';
 
-    return {
-      category,
-      confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.5,
-      phones:    Array.isArray(parsed.phones)    ? parsed.phones    : [],
-      emails:    Array.isArray(parsed.emails)    ? parsed.emails    : [],
-      addresses: Array.isArray(parsed.addresses) ? parsed.addresses : [],
-      names:     Array.isArray(parsed.names)     ? parsed.names     : [],
-      companies: Array.isArray(parsed.companies) ? parsed.companies : [],
-      websites:  Array.isArray(parsed.websites)  ? parsed.websites  : [],
-      dates:     Array.isArray(parsed.dates)     ? parsed.dates     : [],
-      summary:   parsed.summary || '',
-      custom:    parsed.custom && typeof parsed.custom === 'object' ? parsed.custom : {},
-    };
-  } catch (err) {
-    const msg = err.message || '';
+      return {
+        category,
+        confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.5,
+        phones:    Array.isArray(parsed.phones)    ? parsed.phones    : [],
+        emails:    Array.isArray(parsed.emails)    ? parsed.emails    : [],
+        addresses: Array.isArray(parsed.addresses) ? parsed.addresses : [],
+        names:     Array.isArray(parsed.names)     ? parsed.names     : [],
+        companies: Array.isArray(parsed.companies) ? parsed.companies : [],
+        websites:  Array.isArray(parsed.websites)  ? parsed.websites  : [],
+        dates:     Array.isArray(parsed.dates)     ? parsed.dates     : [],
+        summary:   parsed.summary || '',
+        custom:    parsed.custom && typeof parsed.custom === 'object' ? parsed.custom : {},
+      };
+    } catch (err) {
+      const msg = err.message || '';
 
-    // Rate limit — back off
-    if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
-      console.warn('[Gemini] Rate limited. Using regex fallback.');
+      // Rate limit — wait and retry
+      if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
+        if (attempt < 2) {
+          const waitSec = 15 * (attempt + 1); // 15s, 30s
+          console.log(`[Gemini] Rate limited. Waiting ${waitSec}s before retry (${attempt + 1}/2)`);
+          await sleep(waitSec * 1000);
+          continue;
+        }
+        console.warn('[Gemini] Rate limit retries exhausted. Using regex fallback.');
+        return null;
+      }
+
+      // JSON parse error — don't retry
+      if (msg.includes('JSON')) {
+        console.warn('[Gemini] JSON parse error:', msg);
+        return null;
+      }
+
+      console.warn('[Gemini] Error:', msg);
       return null;
     }
-
-    console.warn('[Gemini] Error:', msg);
-    return null;
   }
+  return null;
 }
 
 // ─── PUBLIC: classifyEmail (standalone) ─────────────────────────────────────
