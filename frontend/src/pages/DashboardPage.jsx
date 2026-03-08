@@ -51,7 +51,12 @@ function CategoryModal({ account, onClose, onSync }) {
 
     try {
       const categories = selected.includes('other') ? [] : selected
-      await api.post(`/email/sync/${account._id}`, { categories })
+      const syncRes = await api.post(`/email/sync/${account._id}`, { categories })
+
+      // Show AI warning if rate limited
+      if (syncRes.data.aiWarning) {
+        toast(syncRes.data.aiWarning, { icon: '⚠️', duration: 5000 })
+      }
 
       // Poll for progress
       const pollInterval = setInterval(async () => {
@@ -69,6 +74,9 @@ function CategoryModal({ account, onClose, onSync }) {
               toast.error(data.message || 'Sync failed')
             } else {
               toast.success(data.message || `${data.processed} emails extracted`)
+              if (data.aiWarning) {
+                toast(data.aiWarning, { icon: '⚠️', duration: 4000 })
+              }
             }
 
             onSync()
