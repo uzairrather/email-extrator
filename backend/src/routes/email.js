@@ -107,7 +107,7 @@ router.post('/sync/:accountId', async (req, res) => {
       processed: 0,
       skipped: 0,
       status: 'fetching',
-      message: 'Fetching emails...',
+      message: 'Clearing old data & fetching emails...',
     });
 
     // Return immediately
@@ -116,6 +116,12 @@ router.post('/sync/:accountId', async (req, res) => {
     // ─── Background processing ──────────────────────────────────────────
     (async () => {
       try {
+        // Delete all previous records for this account (fresh sync)
+        await ExtractedData.deleteMany({
+          userId: req.user._id,
+          emailAccountId: account._id,
+        });
+
         const extractAll = !selectedCategories || selectedCategories.includes('other');
         const service = account.provider === 'gmail' ? gmailService : outlookService;
         const emails = await service.fetchUnreadEmails(account, 50);

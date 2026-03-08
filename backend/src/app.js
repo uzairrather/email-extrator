@@ -13,12 +13,15 @@ const app = express();
 // Connect DB
 connectDB();
 
+// Trust proxy (required for Render/Heroku/Railway behind reverse proxy)
+app.set('trust proxy', 1);
+
 // Middleware
 app.use(cors({ origin: process.env.CLIENT_URL, credentials: true }));
 app.use(express.json());
 
 // Rate limiting
-app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
+app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 300 }));
 
 // Routes
 app.use('/api/auth', authRoutes);
