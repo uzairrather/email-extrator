@@ -150,7 +150,7 @@ CLASSIFY into exactly ONE category:
 - sales_lead: buying intent, pricing/demo requests, RFPs, purchase inquiries
 - job_application: resumes, cover letters, job seekers, recruiter outreach
 - customer_support: existing customer issues, complaints, help/support requests
-- newsletter_spam: marketing, newsletters, bank alerts, OTP, automated bulk mail
+- newsletter_spam: marketing, newsletters, bank alerts, OTP, automated bulk mail, pricing updates, product announcements
 - other: anything that doesn't clearly fit above
 
 EXTRACT all structured data found in the email.
@@ -158,16 +158,18 @@ EXTRACT all structured data found in the email.
 Return this exact JSON:
 {"category":"one_key","confidence":0.95,"phones":[],"emails":[],"addresses":[],"names":[],"companies":[],"websites":[],"dates":[],"summary":"One sentence about this email","custom":{}}
 
-RULES:
-- Only extract REAL data from the email. NEVER invent data.
-- phones: include country code if present (+91, +1 etc).
-- emails: only valid emails from the content body.
-- names: human names only, not companies or email addresses.
-- companies: business/organization names.
-- websites: clean URLs, remove tracking params.
-- addresses: physical addresses including Indian formats.
-- dates: appointments, deadlines, meeting times mentioned.
-- Empty array [] if nothing found. JSON only, no markdown.`;
+STRICT RULES:
+- Only extract REAL data from the email. NEVER invent or hallucinate data.
+- If a field has no data, return an EMPTY array []. Do NOT force data into fields.
+- phones: real phone numbers only (with country code if present). NOT ticket numbers, order numbers, or IDs.
+- emails: only valid email addresses from the email body. NOT the sender's email from the header.
+- names: real human names only. NOT company names, product names, or email addresses.
+- companies: business/organization names only. NOT product features or plan names.
+- websites: real URLs only. Remove tracking parameters. NOT internal links or anchors.
+- addresses: ONLY real physical/postal addresses (street, city, state, zip, country). Examples: "123 Main St, New York, NY 10001" or "Sector 5, Noida, UP 201301". NEVER include product descriptions, feature lists, bullet points, pricing info, or any non-address text.
+- dates: only specific dates for appointments, deadlines, or meetings. NOT general timeframes like "over the years".
+- summary: one factual sentence about what this email is about.
+JSON only, no markdown.`;
 
 async function geminiClassifyAndExtract(from, subject, snippet, bodyText) {
   const client = getGemini();

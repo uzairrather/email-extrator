@@ -30,6 +30,7 @@ const CAT_COLORS = {
 function CategoryModal({ account, onClose, onSync }) {
   const [selected, setSelected] = useState(['business_inquiry', 'sales_lead', 'job_application'])
   const [syncing, setSyncing] = useState(false)
+  const [progress, setProgress] = useState(null)
 
   const toggle = (key) => {
     if (key === 'newsletter_spam') return
@@ -46,22 +47,55 @@ function CategoryModal({ account, onClose, onSync }) {
 
   const handleSync = async () => {
     setSyncing(true)
+    setProgress({ message: 'Starting sync...', current: 0, total: 0 })
+
     try {
       const categories = selected.includes('other') ? [] : selected
-      const res = await api.post(`/email/sync/${account._id}`, { categories })
-      toast.success(`${res.data.processed} emails extracted, ${res.data.skipped} skipped`)
-      onSync()
-      onClose()
+      await api.post(`/email/sync/${account._id}`, { categories })
+
+      // Poll for progress
+      const pollInterval = setInterval(async () => {
+        try {
+          const res = await api.get(`/email/sync-status/${account._id}`)
+          const data = res.data
+
+          setProgress(data)
+
+          if (data.done) {
+            clearInterval(pollInterval)
+            setSyncing(false)
+
+            if (data.status === 'error') {
+              toast.error(data.message || 'Sync failed')
+            } else {
+              toast.success(data.message || `${data.processed} emails extracted`)
+            }
+
+            onSync()
+            setTimeout(() => onClose(), 500)
+          }
+        } catch {
+          clearInterval(pollInterval)
+          setSyncing(false)
+          toast.error('Failed to check sync status')
+          onClose()
+        }
+      }, 2000)
+
     } catch (err) {
       toast.error(err.response?.data?.error || 'Sync failed')
-    } finally {
       setSyncing(false)
+      setProgress(null)
     }
   }
 
+  const progressPercent = progress?.total > 0
+    ? Math.round((progress.current / progress.total) * 100)
+    : 0
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={!syncing ? onClose : undefined} />
       <div className="relative w-full max-w-sm bg-[#252525] rounded-2xl overflow-hidden shadow-2xl border border-white/5">
         {/* Header */}
         <div className="flex items-center justify-between px-5 pt-5 pb-3">
@@ -69,64 +103,90 @@ function CategoryModal({ account, onClose, onSync }) {
             <h2 className="text-base font-semibold text-white">Select Email Types</h2>
             <p className="text-xs text-slate-500 mt-0.5">{account.email}</p>
           </div>
-          <button onClick={onClose} className="p-1.5 rounded-full hover:bg-white/10 text-slate-500 hover:text-white transition-colors">
-            <X size={14} />
-          </button>
+          {!syncing && (
+            <button onClick={onClose} className="p-1.5 rounded-full hover:bg-white/10 text-slate-500 hover:text-white transition-colors">
+              <X size={14} />
+            </button>
+          )}
         </div>
+
+        {/* Progress bar (shown during sync) */}
+        {syncing && progress && (
+          <div className="px-5 pb-3">
+            <div className="w-full bg-slate-700 rounded-full h-2 mb-2">
+              <div
+                className="bg-green-500 h-2 rounded-full transition-all duration-500"
+                style={{ width: `${progressPercent}%` }}
+              />
+            </div>
+            <p className="text-xs text-slate-400">{progress.message}</p>
+            {progress.total > 0 && (
+              <p className="text-xs text-slate-500 mt-0.5">
+                {progress.processed} extracted · {progress.skipped} skipped
+              </p>
+            )}
+          </div>
+        )}
 
         {/* Category list */}
-        <div className="px-2 pb-2">
-          {ALL_CATEGORIES.map((cat, i) => {
-            const isSelected = selected.includes(cat.key)
-            const isSpam     = cat.key === 'newsletter_spam'
+        {!syncing && (
+          <div className="px-2 pb-2">
+            {ALL_CATEGORIES.map((cat, i) => {
+              const isSelected = selected.includes(cat.key)
+              const isSpam     = cat.key === 'newsletter_spam'
 
-            return (
-              <div key={cat.key}>
-                <button
-                  onClick={() => toggle(cat.key)}
-                  disabled={isSpam}
-                  className={`w-full flex items-center gap-3 px-3 py-3.5 rounded-xl text-left transition-colors
-                    ${isSelected && !isSpam ? 'bg-white/10' : 'hover:bg-white/5'}
-                    ${isSpam ? 'opacity-40 cursor-default' : 'cursor-pointer'}
-                  `}
-                >
-                  {/* Checkbox */}
-                  <div className={`w-5 h-5 rounded flex items-center justify-center border flex-shrink-0 transition-all
-                    ${isSelected && !isSpam ? 'bg-white border-white' : 'border-white/20'}
-                  `}>
-                    {isSelected && !isSpam && (
-                      <svg width="10" height="8" viewBox="0 0 10 8" fill="none">
-                        <path d="M1 4L3.5 6.5L9 1" stroke="#000" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
-                      </svg>
-                    )}
-                  </div>
-                  <span className={`text-sm font-medium ${isSpam ? 'text-slate-600' : isSelected ? 'text-white' : 'text-slate-300'}`}>
-                    {cat.label}
-                  </span>
-                </button>
-                {i < ALL_CATEGORIES.length - 1 && (
-                  <div className="mx-3 border-b border-white/5" />
-                )}
-              </div>
-            )
-          })}
-        </div>
+              return (
+                <div key={cat.key}>
+                  <button
+                    onClick={() => toggle(cat.key)}
+                    disabled={isSpam}
+                    className={`w-full flex items-center gap-3 px-3 py-3.5 rounded-xl text-left transition-colors
+                      ${isSelected && !isSpam ? 'bg-white/10' : 'hover:bg-white/5'}
+                      ${isSpam ? 'opacity-40 cursor-default' : 'cursor-pointer'}
+                    `}
+                  >
+                    <div className={`w-5 h-5 rounded flex items-center justify-center border flex-shrink-0 transition-all
+                      ${isSelected && !isSpam ? 'bg-white border-white' : 'border-white/20'}
+                    `}>
+                      {isSelected && !isSpam && (
+                        <svg width="10" height="8" viewBox="0 0 10 8" fill="none">
+                          <path d="M1 4L3.5 6.5L9 1" stroke="#000" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+                        </svg>
+                      )}
+                    </div>
+                    <span className={`text-sm font-medium ${isSpam ? 'text-slate-600' : isSelected ? 'text-white' : 'text-slate-300'}`}>
+                      {cat.label}
+                    </span>
+                  </button>
+                  {i < ALL_CATEGORIES.length - 1 && (
+                    <div className="mx-3 border-b border-white/5" />
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )}
 
         {/* Footer */}
         <div className="px-4 py-4 border-t border-white/5 flex gap-3">
-          <button onClick={onClose} className="flex-1 py-2.5 rounded-xl text-sm text-slate-400 hover:text-white hover:bg-white/5 transition-colors border border-white/10">
-            Cancel
-          </button>
-          <button
-            onClick={handleSync}
-            disabled={syncing || selected.length === 0}
-            className="flex-1 py-2.5 rounded-xl text-sm font-semibold bg-white text-black hover:bg-slate-100 transition-colors disabled:opacity-40"
-          >
-            {syncing
-              ? <span className="flex items-center justify-center gap-2"><RefreshCw size={12} className="animate-spin" /> Syncing…</span>
-              : `Extract ${selected.includes('other') ? 'All' : `(${selected.length})`}`
-            }
-          </button>
+          {!syncing ? (
+            <>
+              <button onClick={onClose} className="flex-1 py-2.5 rounded-xl text-sm text-slate-400 hover:text-white hover:bg-white/5 transition-colors border border-white/10">
+                Cancel
+              </button>
+              <button
+                onClick={handleSync}
+                disabled={selected.length === 0}
+                className="flex-1 py-2.5 rounded-xl text-sm font-semibold bg-white text-black hover:bg-slate-100 transition-colors disabled:opacity-40"
+              >
+                {`Extract ${selected.includes('other') ? 'All' : `(${selected.length})`}`}
+              </button>
+            </>
+          ) : (
+            <div className="flex-1 py-2.5 rounded-xl text-sm text-center text-slate-400 flex items-center justify-center gap-2">
+              <RefreshCw size={12} className="animate-spin" /> Processing...
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -196,7 +256,6 @@ export default function DashboardPage() {
         <p className="text-slate-400 text-sm mt-1">Connect your email and choose which types to extract data from.</p>
       </div>
 
-      {/* Stats row */}
       {stats && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
           {[
@@ -213,7 +272,6 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* Category breakdown */}
       {stats?.byCategory && Object.keys(stats.byCategory).length > 0 && (
         <div className="card p-4 mb-6">
           <p className="text-xs text-slate-500 mb-3 flex items-center gap-1.5">
@@ -232,7 +290,6 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* Connect buttons */}
       <div className="card p-5 mb-6">
         <h2 className="text-sm font-medium text-slate-300 mb-4">Connect a new account</h2>
         <div className="flex gap-3 flex-wrap">
@@ -254,7 +311,6 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      {/* Accounts list */}
       <div className="space-y-3">
         <h2 className="text-sm font-medium text-slate-300">Connected accounts ({accounts.length})</h2>
         {accounts.length === 0 ? (

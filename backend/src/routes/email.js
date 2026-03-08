@@ -13,6 +13,9 @@ const {
 const router = express.Router();
 router.use(authMiddleware);
 
+// ─── In-memory sync progress tracker ────────────────────────────────────────
+const syncProgress = new Map();
+
 // GET /api/email/categories
 router.get('/categories', (req, res) => {
   const labels = {
@@ -52,16 +55,27 @@ router.delete('/accounts/:id', async (req, res) => {
   }
 });
 
+// GET /api/email/sync-status/:accountId — poll sync progress
+router.get('/sync-status/:accountId', (req, res) => {
+  const key = `${req.user._id}_${req.params.accountId}`;
+  const progress = syncProgress.get(key);
+
+  if (!progress) {
+    return res.json({ status: 'idle' });
+  }
+
+  res.json(progress);
+
+  // Clean up if done
+  if (progress.done) {
+    setTimeout(() => syncProgress.delete(key), 30000);
+  }
+});
+
 /**
  * POST /api/email/sync/:accountId
- *
- * Body: { categories: ['sales_lead', ...] }
- *
- * Flow:
- *   1. Fetch unread emails
- *   2. Skip already-extracted emails
- *   3. Re-process previously skipped emails if they match NEW category selection
- *   4. New emails: heuristic pre-filter → Gemini classify+extract → save
+ * Returns immediately, processes in background.
+ * Frontend polls GET /sync-status/:accountId for progress.
  */
 router.post('/sync/:accountId', async (req, res) => {
   try {
@@ -77,172 +91,223 @@ router.post('/sync/:accountId', async (req, res) => {
       ? req.body.categories
       : null;
 
-    const extractAll = !selectedCategories || selectedCategories.includes('other');
+    const key = `${req.user._id}_${account._id}`;
 
-    const service = account.provider === 'gmail' ? gmailService : outlookService;
-    const emails = await service.fetchUnreadEmails(account, 50);
-
-    if (!emails.length) {
-      return res.json({ message: 'No unread emails found', processed: 0, skipped: 0 });
+    // Check if already syncing
+    const existing = syncProgress.get(key);
+    if (existing && !existing.done) {
+      return res.json({ background: true, message: 'Sync already in progress' });
     }
 
-    let processed = 0;
-    let skipped = 0;
-    const results = [];
+    // Initialize progress
+    syncProgress.set(key, {
+      done: false,
+      total: 0,
+      current: 0,
+      processed: 0,
+      skipped: 0,
+      status: 'fetching',
+      message: 'Fetching emails...',
+    });
 
-    for (const email of emails) {
-      // ── Check existing record ──
-      const existing = await ExtractedData.findOne({
-        userId: req.user._id,
-        emailId: email.id,
-        emailAccountId: account._id,
-      });
+    // Return immediately
+    res.json({ background: true, message: 'Sync started' });
 
-      // Already extracted → always skip
-      if (existing && existing.status === 'extracted') {
-        skipped++;
-        continue;
-      }
+    // ─── Background processing ──────────────────────────────────────────
+    (async () => {
+      try {
+        const extractAll = !selectedCategories || selectedCategories.includes('other');
+        const service = account.provider === 'gmail' ? gmailService : outlookService;
+        const emails = await service.fetchUnreadEmails(account, 50);
 
-      // Previously skipped → re-check if it matches NEW selection
-      if (existing && existing.status === 'skipped') {
-        const nowMatches = extractAll
-          ? existing.category !== 'newsletter_spam'
-          : selectedCategories.includes(existing.category);
-
-        if (!nowMatches) {
-          skipped++;
-          continue;
-        }
-
-        // Matches now → re-process with full extraction
-        let bodyText = email.snippet;
-        try { bodyText = await service.getEmailBody(account, email.id); } catch (_) {}
-
-        let result;
-        try {
-          result = await classifyAndExtract(email.fromEmail, email.subject, email.snippet, bodyText);
-        } catch (err) {
-          console.error('[Sync] Re-process error:', email.id, err.message);
-          skipped++;
-          continue;
-        }
-
-        const aiMatches = extractAll
-          ? result.category !== 'newsletter_spam'
-          : selectedCategories.includes(result.category);
-
-        if (!aiMatches) {
-          await ExtractedData.findByIdAndUpdate(existing._id, { category: result.category, status: 'skipped' });
-          skipped++;
-          continue;
-        }
-
-        const { category, confidence, summary, ...extractedFields } = result;
-        await ExtractedData.findByIdAndUpdate(existing._id, {
-          category,
-          status: 'extracted',
-          extractedFields: { ...extractedFields, summary: summary || '' },
+        syncProgress.set(key, {
+          ...syncProgress.get(key),
+          total: emails.length,
+          status: 'processing',
+          message: `Processing ${emails.length} emails...`,
         });
-        results.push({ emailId: email.id, subject: email.subject, category, confidence, extracted: extractedFields });
-        processed++;
-        continue;
-      }
 
-      // Failed → delete and retry
-      if (existing && existing.status === 'failed') {
-        await ExtractedData.findByIdAndDelete(existing._id);
-      }
+        if (!emails.length) {
+          syncProgress.set(key, {
+            done: true, total: 0, current: 0, processed: 0, skipped: 0,
+            status: 'complete', message: 'No unread emails found',
+          });
+          return;
+        }
 
-      // ── NEW EMAIL ──
+        let processed = 0;
+        let skipped = 0;
 
-      // Stage 1: Heuristic pre-filter (FREE)
-      const heuristic = heuristicPreFilter(email.fromEmail, email.subject, email.snippet);
+        for (let i = 0; i < emails.length; i++) {
+          const email = emails[i];
 
-      if (heuristic.confidence === 'high') {
-        const matchesSelection = extractAll
-          ? heuristic.category !== 'newsletter_spam'
-          : selectedCategories.includes(heuristic.category);
+          // Update progress
+          syncProgress.set(key, {
+            ...syncProgress.get(key),
+            current: i + 1,
+            processed,
+            skipped,
+            message: `Processing ${i + 1} / ${emails.length}...`,
+          });
 
-        if (!matchesSelection) {
+          // ── Check existing record ──
+          const existingRecord = await ExtractedData.findOne({
+            userId: req.user._id,
+            emailId: email.id,
+            emailAccountId: account._id,
+          });
+
+          if (existingRecord && existingRecord.status === 'extracted') {
+            skipped++;
+            continue;
+          }
+
+          // Previously skipped → re-check if matches NEW selection
+          if (existingRecord && existingRecord.status === 'skipped') {
+            const nowMatches = extractAll
+              ? existingRecord.category !== 'newsletter_spam'
+              : selectedCategories.includes(existingRecord.category);
+
+            if (!nowMatches) {
+              skipped++;
+              continue;
+            }
+
+            let bodyText = email.snippet;
+            try { bodyText = await service.getEmailBody(account, email.id); } catch (_) {}
+
+            let result;
+            try {
+              result = await classifyAndExtract(email.fromEmail, email.subject, email.snippet, bodyText);
+            } catch (err) {
+              console.error('[Sync] Re-process error:', email.id, err.message);
+              skipped++;
+              continue;
+            }
+
+            const aiMatches = extractAll
+              ? result.category !== 'newsletter_spam'
+              : selectedCategories.includes(result.category);
+
+            if (!aiMatches) {
+              await ExtractedData.findByIdAndUpdate(existingRecord._id, { category: result.category, status: 'skipped' });
+              skipped++;
+              continue;
+            }
+
+            const { category, confidence, summary, ...extractedFields } = result;
+            await ExtractedData.findByIdAndUpdate(existingRecord._id, {
+              category, status: 'extracted',
+              extractedFields: { ...extractedFields, summary: summary || '' },
+            });
+            processed++;
+            continue;
+          }
+
+          // Failed → delete and retry
+          if (existingRecord && existingRecord.status === 'failed') {
+            await ExtractedData.findByIdAndDelete(existingRecord._id);
+          }
+
+          // ── NEW EMAIL ──
+          const heuristic = heuristicPreFilter(email.fromEmail, email.subject, email.snippet);
+
+          if (heuristic.confidence === 'high') {
+            const matchesSelection = extractAll
+              ? heuristic.category !== 'newsletter_spam'
+              : selectedCategories.includes(heuristic.category);
+
+            if (!matchesSelection) {
+              try {
+                await ExtractedData.create({
+                  userId: req.user._id, emailAccountId: account._id, emailId: email.id,
+                  subject: email.subject, fromEmail: email.fromEmail, fromName: email.fromName,
+                  receivedAt: email.date ? new Date(email.date) : null,
+                  rawSnippet: email.snippet, category: heuristic.category, status: 'skipped',
+                });
+              } catch (dupErr) { if (dupErr.code !== 11000) console.error(dupErr); }
+              skipped++;
+              continue;
+            }
+          }
+
+          // Get full body
+          let bodyText = email.snippet;
+          try { bodyText = await service.getEmailBody(account, email.id); } catch (_) {}
+
+          // Gemini classify + extract
+          let result;
+          try {
+            result = await classifyAndExtract(email.fromEmail, email.subject, email.snippet, bodyText);
+          } catch (err) {
+            console.error('[Sync] classifyAndExtract error:', email.id, err.message);
+            result = {
+              category: heuristic.category, confidence: 0.2,
+              phones: [], emails: [], addresses: [], names: [],
+              companies: [], websites: [], dates: [], summary: '', custom: {},
+            };
+          }
+
+          // Check if matches selection
+          const categoryMatches = extractAll
+            ? result.category !== 'newsletter_spam'
+            : selectedCategories.includes(result.category);
+
+          if (!categoryMatches) {
+            try {
+              await ExtractedData.create({
+                userId: req.user._id, emailAccountId: account._id, emailId: email.id,
+                subject: email.subject, fromEmail: email.fromEmail, fromName: email.fromName,
+                receivedAt: email.date ? new Date(email.date) : null,
+                rawSnippet: email.snippet, category: result.category, status: 'skipped',
+              });
+            } catch (dupErr) { if (dupErr.code !== 11000) console.error(dupErr); }
+            skipped++;
+            continue;
+          }
+
+          // Save extracted
+          const { category, confidence, summary, ...extractedFields } = result;
           try {
             await ExtractedData.create({
               userId: req.user._id, emailAccountId: account._id, emailId: email.id,
               subject: email.subject, fromEmail: email.fromEmail, fromName: email.fromName,
               receivedAt: email.date ? new Date(email.date) : null,
-              rawSnippet: email.snippet, category: heuristic.category, status: 'skipped',
+              rawSnippet: email.snippet, category, status: 'extracted',
+              extractedFields: { ...extractedFields, summary: summary || '' },
             });
-          } catch (dupErr) { if (dupErr.code !== 11000) throw dupErr; }
-          skipped++;
-          continue;
+            processed++;
+          } catch (dupErr) {
+            if (dupErr.code === 11000) { skipped++; continue; }
+            console.error(dupErr);
+          }
         }
-      }
 
-      // Stage 2: Get full body
-      let bodyText = email.snippet;
-      try { bodyText = await service.getEmailBody(account, email.id); } catch (_) {}
+        // Update last sync time
+        await EmailAccount.findByIdAndUpdate(account._id, { lastSyncAt: new Date() });
 
-      // Stage 3: Gemini classify + extract
-      let result;
-      try {
-        result = await classifyAndExtract(email.fromEmail, email.subject, email.snippet, bodyText);
-      } catch (err) {
-        console.error('[Sync] classifyAndExtract error:', email.id, err.message);
-        result = {
-          category: heuristic.category, confidence: 0.2,
-          phones: [], emails: [], addresses: [], names: [],
-          companies: [], websites: [], dates: [], summary: '', custom: {},
-        };
-      }
-
-      // Stage 4: Check if matches selection
-      const categoryMatches = extractAll
-        ? result.category !== 'newsletter_spam'
-        : selectedCategories.includes(result.category);
-
-      if (!categoryMatches) {
-        try {
-          await ExtractedData.create({
-            userId: req.user._id, emailAccountId: account._id, emailId: email.id,
-            subject: email.subject, fromEmail: email.fromEmail, fromName: email.fromName,
-            receivedAt: email.date ? new Date(email.date) : null,
-            rawSnippet: email.snippet, category: result.category, status: 'skipped',
-          });
-        } catch (dupErr) { if (dupErr.code !== 11000) throw dupErr; }
-        skipped++;
-        continue;
-      }
-
-      // Stage 5: Save extracted
-      const { category, confidence, summary, ...extractedFields } = result;
-      try {
-        await ExtractedData.create({
-          userId: req.user._id, emailAccountId: account._id, emailId: email.id,
-          subject: email.subject, fromEmail: email.fromEmail, fromName: email.fromName,
-          receivedAt: email.date ? new Date(email.date) : null,
-          rawSnippet: email.snippet, category, status: 'extracted',
-          extractedFields: { ...extractedFields, summary: summary || '' },
+        // Mark complete
+        syncProgress.set(key, {
+          done: true,
+          total: emails.length,
+          current: emails.length,
+          processed,
+          skipped,
+          status: 'complete',
+          message: processed > 0
+            ? `Found ${processed} matching emails (${skipped} skipped)`
+            : `No matching emails found in ${emails.length} unread emails`,
         });
-        results.push({ emailId: email.id, subject: email.subject, category, confidence, extracted: extractedFields });
-        processed++;
-      } catch (dupErr) {
-        if (dupErr.code === 11000) { skipped++; continue; }
-        throw dupErr;
+
+      } catch (err) {
+        console.error('[Sync] Background error:', err.message);
+        syncProgress.set(key, {
+          done: true, total: 0, current: 0, processed: 0, skipped: 0,
+          status: 'error', message: err.message,
+        });
       }
-    }
+    })();
 
-    await EmailAccount.findByIdAndUpdate(account._id, { lastSyncAt: new Date() });
-
-    res.json({
-      message: processed > 0
-        ? `Found ${processed} matching emails (${skipped} skipped)`
-        : `No ${selectedCategories ? selectedCategories.join('/') : ''} emails found in ${emails.length} unread emails`,
-      processed,
-      skipped,
-      total: emails.length,
-      selectedCategories: selectedCategories || ['all'],
-      results,
-    });
   } catch (err) {
     console.error('[Sync] Fatal error:', err.message);
     res.status(500).json({ error: err.message });
