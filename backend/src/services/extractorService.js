@@ -35,6 +35,7 @@ const hasGemini = () =>
 // ─── Rate limit tracker ─────────────────────────────────────────────────────
 let dailyRequestCount = 0;
 let dailyResetAt = 0;
+let rateLimitedUntil = 0; // timestamp when rate limit expires
 const DAILY_LIMIT = 240; // stay under 250 RPD with buffer
 
 function checkDailyLimit() {
@@ -42,11 +43,25 @@ function checkDailyLimit() {
   // Reset counter at midnight-ish (every 24h)
   if (now > dailyResetAt) {
     dailyRequestCount = 0;
+    rateLimitedUntil = 0;
     const tomorrow = new Date();
     tomorrow.setHours(24, 0, 0, 0);
     dailyResetAt = tomorrow.getTime();
   }
   return dailyRequestCount < DAILY_LIMIT;
+}
+
+// Check if Gemini is currently rate limited
+function isGeminiAvailable() {
+  if (!hasGemini()) return { available: false, reason: 'No Gemini API key configured. Using regex extraction.' };
+  if (Date.now() < rateLimitedUntil) {
+    const minsLeft = Math.ceil((rateLimitedUntil - Date.now()) / 60000);
+    return { available: false, reason: `AI extraction limit reached. Try again in ~${minsLeft} minutes. Using basic extraction for now.` };
+  }
+  if (!checkDailyLimit()) {
+    return { available: false, reason: 'Daily AI extraction limit reached (250 requests). Resets at midnight. Using basic extraction for now.' };
+  }
+  return { available: true, reason: null };
 }
 
 // ─── Categories ─────────────────────────────────────────────────────────────
@@ -175,17 +190,15 @@ async function geminiClassifyAndExtract(from, subject, snippet, bodyText) {
   const client = getGemini();
   if (!client || !checkDailyLimit()) return null;
 
-  // 7s delay between calls — Gemini free tier is 10 RPM
-  await sleep(7000);
+  // 2s delay between calls — some may hit rate limit and fall back to regex
+  await sleep(2000);
 
   const emailContent = `From: ${from || 'unknown'}
 Subject: ${subject || 'no subject'}
 Body:
-${(bodyText || snippet || 'no content').slice(0, 3000)}`;
+${(bodyText || snippet || 'no content').slice(0, 1500)}`;
 
-  // Retry up to 2 times on rate limit
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
+  try {
       const response = await client.models.generateContent({
         model: 'gemini-2.5-flash',
         contents: [
@@ -196,16 +209,55 @@ ${(bodyText || snippet || 'no content').slice(0, 3000)}`;
         ],
         config: {
           temperature: 0.1,
-          maxOutputTokens: 800,
+          maxOutputTokens: 2048,
           responseMimeType: 'application/json',
         },
       });
 
       dailyRequestCount++;
 
-      const raw = response.text.trim();
-      const cleaned = raw.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
-      const parsed = JSON.parse(cleaned);
+      let raw = (response.text || '').trim();
+      let cleaned = raw.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+
+      // Try to fix truncated JSON — close any open braces/brackets
+      let parsed;
+      try {
+        parsed = JSON.parse(cleaned);
+      } catch (parseErr) {
+        console.warn('[Gemini] Raw response length:', cleaned.length, 'Error:', parseErr.message);
+        console.warn('[Gemini] Last 100 chars:', cleaned.slice(-100));
+
+        // Attempt to fix common truncation issues
+        let fixed = cleaned;
+        // Close unclosed strings
+        const quoteCount = (fixed.match(/"/g) || []).length;
+        if (quoteCount % 2 !== 0) fixed += '"';
+        // Close unclosed arrays/objects
+        const openBrackets = (fixed.match(/\[/g) || []).length - (fixed.match(/\]/g) || []).length;
+        const openBraces = (fixed.match(/\{/g) || []).length - (fixed.match(/\}/g) || []).length;
+        for (let i = 0; i < openBrackets; i++) fixed += ']';
+        for (let i = 0; i < openBraces; i++) fixed += '}';
+
+        try {
+          parsed = JSON.parse(fixed);
+          console.log('[Gemini] Fixed truncated JSON successfully');
+        } catch {
+          // Last resort: try to extract just the category from partial JSON
+          const catMatch = cleaned.match(/"category"\s*:\s*"([^"]+)"/);
+          if (catMatch && CATEGORIES.includes(catMatch[1])) {
+            console.log('[Gemini] Extracted category from partial JSON:', catMatch[1]);
+            return {
+              category: catMatch[1],
+              confidence: 0.5,
+              phones: [], emails: [], addresses: [], names: [],
+              companies: [], websites: [], dates: [],
+              summary: '', custom: {},
+            };
+          }
+          console.warn('[Gemini] Could not fix truncated JSON, using regex fallback');
+          return null;
+        }
+      }
 
       const category = CATEGORIES.includes(parsed.category) ? parsed.category : 'other';
 
@@ -224,30 +276,15 @@ ${(bodyText || snippet || 'no content').slice(0, 3000)}`;
       };
     } catch (err) {
       const msg = err.message || '';
-
-      // Rate limit — wait and retry
       if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
-        if (attempt < 2) {
-          const waitSec = 15 * (attempt + 1); // 15s, 30s
-          console.log(`[Gemini] Rate limited. Waiting ${waitSec}s before retry (${attempt + 1}/2)`);
-          await sleep(waitSec * 1000);
-          continue;
-        }
-        console.warn('[Gemini] Rate limit retries exhausted. Using regex fallback.');
-        return null;
+        // Set rate limit for 2 minutes so we don't keep hitting it
+        rateLimitedUntil = Date.now() + (2 * 60 * 1000);
+        console.warn('[Gemini] Rate limited. Pausing AI for 2 minutes.');
+      } else {
+        console.warn('[Gemini] Error:', msg);
       }
-
-      // JSON parse error — don't retry
-      if (msg.includes('JSON')) {
-        console.warn('[Gemini] JSON parse error:', msg);
-        return null;
-      }
-
-      console.warn('[Gemini] Error:', msg);
       return null;
     }
-  }
-  return null;
 }
 
 // ─── PUBLIC: classifyEmail (standalone) ─────────────────────────────────────
@@ -292,12 +329,12 @@ async function extractFromEmail(text) {
       contents: [
         {
           role: 'user',
-          parts: [{ text: `Extract contact data from this email. Return ONLY JSON:\n{"phones":[],"emails":[],"addresses":[],"names":[],"companies":[],"websites":[],"dates":[],"summary":"","custom":{}}\nRules: Only REAL data. No hallucination. Empty array if nothing. No markdown.\n\nEMAIL:\n${text.slice(0, 3000)}` }],
+          parts: [{ text: `Extract contact data from this email. Return ONLY JSON:\n{"phones":[],"emails":[],"addresses":[],"names":[],"companies":[],"websites":[],"dates":[],"summary":"","custom":{}}\nRules: Only REAL data. No hallucination. Empty array if nothing. No markdown.\n\nEMAIL:\n${text.slice(0, 1500)}` }],
         },
       ],
       config: {
         temperature: 0.1,
-        maxOutputTokens: 800,
+        maxOutputTokens: 2048,
         responseMimeType: 'application/json',
       },
     });
@@ -383,5 +420,6 @@ module.exports = {
   extractFromEmail,
   classifyAndExtract,
   heuristicPreFilter,
+  isGeminiAvailable,
   CATEGORIES,
 };

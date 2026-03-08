@@ -7,6 +7,7 @@ const outlookService = require('../services/outlookService');
 const {
   classifyAndExtract,
   heuristicPreFilter,
+  isGeminiAvailable,
   CATEGORIES,
 } = require('../services/extractorService');
 
@@ -56,6 +57,11 @@ router.delete('/accounts/:id', async (req, res) => {
 });
 
 // GET /api/email/sync-status/:accountId — poll sync progress
+// GET /api/email/ai-status — check if AI extraction is available
+router.get('/ai-status', (req, res) => {
+  res.json(isGeminiAvailable());
+});
+
 router.get('/sync-status/:accountId', (req, res) => {
   const key = `${req.user._id}_${req.params.accountId}`;
   const progress = syncProgress.get(key);
@@ -99,6 +105,9 @@ router.post('/sync/:accountId', async (req, res) => {
       return res.json({ background: true, message: 'Sync already in progress' });
     }
 
+    // Check AI availability
+    const aiStatus = isGeminiAvailable();
+
     // Initialize progress
     syncProgress.set(key, {
       done: false,
@@ -108,10 +117,17 @@ router.post('/sync/:accountId', async (req, res) => {
       skipped: 0,
       status: 'fetching',
       message: 'Clearing old data & fetching emails...',
+      aiAvailable: aiStatus.available,
+      aiWarning: aiStatus.reason,
     });
 
-    // Return immediately
-    res.json({ background: true, message: 'Sync started' });
+    // Return immediately with AI status
+    res.json({
+      background: true,
+      message: 'Sync started',
+      aiAvailable: aiStatus.available,
+      aiWarning: aiStatus.reason,
+    });
 
     // ─── Background processing ──────────────────────────────────────────
     (async () => {
